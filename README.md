@@ -12,11 +12,131 @@ PSux uses a terminal-style continuous flow layout instead of a form-style output
 - Windows paths are displayed in a Linux-like form by default, for example `D:\Project\PSux` becomes `/d/Project/PSux`.
 - Command history, output, and the next prompt all appear in a single scrollable transcript.
 
+## Tabs
+
+PSux now supports top-level terminal workspaces with tabs.
+
+- Each tab is an independent terminal workspace.
+- Each tab keeps its own:
+  - current working directory state
+  - command history
+  - environment variables
+  - output transcript
+  - split pane layout
+- New tab: toolbar `New Tab` button or `Ctrl+T`
+- Close current tab: `Ctrl+W`
+- Rename tab: double-click the tab label
+- At least one tab is always kept alive, so closing tabs will not leave the UI in a broken state.
+
+### Tab State Management
+
+- Data structure: each tab is a `TerminalWorkspace` widget defined in `ui/workspace_tabs.py`.
+- Each `TerminalWorkspace` owns one `PaneManager`.
+- Each `PaneManager` owns its own pane tree, split layout, and per-pane `SessionState`.
+- Because each tab contains a different `PaneManager` instance, tab switching naturally preserves independent workspace state without global mutation.
+
+## PowerShell Native Commands
+
+PSux supports both Linux-style compatibility commands and native PowerShell commands.
+
+Execution priority:
+
+1. Internal special commands such as `cd`, `export`, `history`, `clear`, and `Set-Location`
+2. Linux compatibility commands that PSux translates
+3. `git ...` passthrough and local `./xxx.bat` / `./xxx.exe`
+4. Everything else runs as a native PowerShell command
+
+Examples that now run directly as PowerShell:
+
+```powershell
+Get-ChildItem
+Get-Location
+Set-Location ui
+Get-Process
+Select-String "PSux" README.md
+Test-Path README.md
+New-Item demo.txt
+Remove-Item demo.txt
+```
+
+This design keeps Linux muscle memory for common commands while still letting Windows developers use real PowerShell without fighting the translator.
+
+## Quick Commands
+
+PSux includes a lightweight Quick Commands palette for long, high-frequency commands such as Unreal build commands, complex Git flows, and PowerShell or Python scripts.
+
+- Open from the top `Quick Commands` button or with `Ctrl+Shift+P`.
+- The main window stays terminal-first because the palette is a popup dialog instead of a permanent side panel.
+- Commands are always inserted into or executed in the current active pane.
+- Each quick command stores:
+  - name
+  - category
+  - full command content
+  - optional note
+- Supported actions:
+  - insert into current pane input
+  - run immediately in current pane
+  - copy to clipboard
+  - create
+  - edit
+  - delete
+
+### Quick Commands Data Structure
+
+```json
+{
+  "id": "5f5b1ff7cf2b428dbd54de43cfb9f6bd",
+  "name": "UE5 Editor Build",
+  "category": "Unreal Build",
+  "command": "RunUAT.bat BuildCookRun -project=\"D:\\Projects\\Game\\Game.uproject\" -platform=Win64",
+  "note": "Local editor build for Win64"
+}
+```
+
+### JSON Storage Format
+
+Quick commands are persisted locally in:
+
+```text
+%APPDATA%\PSux\quick_commands.json
+```
+
+Stored JSON format:
+
+```json
+{
+  "version": 1,
+  "commands": [
+    {
+      "id": "5f5b1ff7cf2b428dbd54de43cfb9f6bd",
+      "name": "UE5 Editor Build",
+      "category": "Unreal Build",
+      "command": "RunUAT.bat BuildCookRun -project=\"D:\\Projects\\Game\\Game.uproject\" -platform=Win64",
+      "note": "Local editor build for Win64"
+    }
+  ]
+}
+```
+
+### Why This UI Stays Simple
+
+- The terminal remains the main visual surface.
+- Quick Commands is hidden until needed, so it does not compete with the Ubuntu-style terminal experience.
+- The list view only shows compact name and category rows.
+- Full command content and note are shown only for the selected item.
+- Insert and run actions are scoped to the current active pane, which keeps split-pane behavior intuitive.
+
 ## Project Structure
 
 ```text
 PSux/
 ├── main.py
+├── quick_commands/
+│   ├── __init__.py
+│   ├── dialog.py
+│   ├── manager.py
+│   ├── models.py
+│   └── storage.py
 ├── requirements.txt
 ├── README.md
 ├── executor/
@@ -38,6 +158,7 @@ PSux/
 │   ├── main_window.py
 │   ├── pane_manager.py
 │   ├── terminal_pane.py
+│   ├── workspace_tabs.py
 │   └── widgets.py
 └── utils/
     ├── __init__.py
@@ -127,7 +248,10 @@ The generated executable will be in `dist\PSux\PSux.exe`.
 - Terminal-style transcript with inline prompt
 - Current prompt format: `PSux:/d/Project/PSux$`
 - Tab completion for commands and paths
+- Quick Commands popup via toolbar button or `Ctrl+Shift+P`
+- Top tab workspaces with independent split layouts and session state
 - Multi-pane split view
+- New tab: `Ctrl+T`
 - Horizontal split: `Ctrl+Shift+H`
 - Vertical split: `Ctrl+Shift+V`
 - Run current command: `Enter` or `Ctrl+Enter`

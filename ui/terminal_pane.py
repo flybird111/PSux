@@ -31,7 +31,7 @@ class TerminalPane(QFrame):
         self._executor = executor
         self.session = session or SessionState()
         self._worker: CommandWorker | None = None
-        self._completion_engine = CompletionEngine(self.session, self._translator.available_commands())
+        self._completion_engine = CompletionEngine(self.session, lambda: self._translator.available_commands(self.session))
 
         self.setObjectName("terminalPane")
         self.setFrameShape(QFrame.StyledPanel)
@@ -145,6 +145,17 @@ class TerminalPane(QFrame):
     def focus_command_input(self) -> None:
         if is_qobject_alive(self.terminal_view):
             self.terminal_view.focus_input()
+
+    def set_command_text(self, command: str) -> None:
+        if not is_qobject_alive(self.terminal_view) or not is_qobject_alive(self.terminal_view.input):
+            return
+        self.terminal_view.input.setText(command)
+        self.terminal_view.input.setCursorPosition(len(command))
+        self.focus_command_input()
+
+    def execute_command_text(self, command: str) -> None:
+        self.set_command_text(command)
+        self.run_current_command()
 
     def run_current_command(self) -> None:
         if not is_qobject_alive(self) or not is_qobject_alive(self.terminal_view):

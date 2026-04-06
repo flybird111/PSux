@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 from session import SessionState
@@ -12,13 +14,24 @@ from utils.path_utils import resolve_user_path
 from utils.text import expand_env_tokens, quote_powershell
 
 
+_POWERSHELL_COMMAND_CACHE: list[str] | None = None
+_PATH_COMMAND_CACHE: dict[tuple[str, str], list[str]] = {}
+
+
 class CommandTranslator:
     def __init__(self) -> None:
         self._parser = CommandParser()
-        self._handlers = {
+        self._special_handlers = {
+            "cd": self._translate_cd,
+            "clear": self._translate_clear,
+            "export": self._translate_export,
+            "history": self._translate_history,
+            "Set-Location": self._translate_set_location,
+            "sl": self._translate_set_location,
+        }
+        self._linux_handlers = {
             "ls": self._translate_ls,
             "pwd": self._translate_pwd,
-            "cd": self._translate_cd,
             "mkdir": self._translate_mkdir,
             "rm": self._translate_rm,
             "cp": self._translate_cp,
@@ -29,10 +42,7 @@ class CommandTranslator:
             "find": self._translate_find,
             "ln": self._translate_ln,
             "echo": self._translate_echo,
-            "clear": self._translate_clear,
             "which": self._translate_which,
-            "export": self._translate_export,
-            "git": self._translate_git,
             "head": self._translate_head,
             "tail": self._translate_tail,
             "less": self._translate_less,
@@ -40,7 +50,6 @@ class CommandTranslator:
             "sort": self._translate_sort,
             "uniq": self._translate_uniq,
             "tree": self._translate_tree,
-            "history": self._translate_history,
             "basename": self._translate_basename,
             "dirname": self._translate_dirname,
             "realpath": self._translate_realpath,
@@ -51,30 +60,185 @@ class CommandTranslator:
             "vim": self._translate_vim,
         }
 
-    def available_commands(self) -> list[str]:
-        return sorted(self._handlers.keys(), key=str.lower)
+    def available_commands(self, session: SessionState | None = None) -> list[str]:
+        commands = set(self._special_handlers) | set(self._linux_handlers) | {"git"}
+        commands.update(self._powershell_command_names())
+        if session is not None:
+            commands.update(self._path_command_names(session))
+        return sorted(commands, key=str.lower)
+
+    def _powershell_command_names(self) -> list[str]:
+        global _POWERSHELL_COMMAND_CACHE
+
+        if _POWERSHELL_COMMAND_CACHE is not None:
+            return _POWERSHELL_COMMAND_CACHE
+
+        fallback = [
+            "Compare-Object",
+            "diff",
+            "Get-ChildItem",
+            "Get-Command",
+            "Get-Location",
+            "Get-Process",
+            "New-Item",
+            "Remove-Item",
+            "Select-String",
+            "Set-Location",
+            "Test-Path",
+        ]
+
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-Command | Select-Object -ExpandProperty Name",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3,
+                check=False,
+            )
+        except OSError:
+            _POWERSHELL_COMMAND_CACHE = fallback
+            return _POWERSHELL_COMMAND_CACHE
+
+        command_names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        _POWERSHELL_COMMAND_CACHE = sorted(set(command_names) | set(fallback), key=str.lower)
+        return _POWERSHELL_COMMAND_CACHE
+
+    def _path_command_names(self, session: SessionState) -> list[str]:
+        effective_env = session.get_effective_env()
+        path_value = effective_env.get("PATH", os.environ.get("PATH", ""))
+        pathext_value = effective_env.get("PATHEXT", os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"))
+        cache_key = (path_value, pathext_value)
+        cached = _PATH_COMMAND_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        extensions = {item.lower() for item in pathext_value.split(";") if item}
+        names: set[str] = set()
+        for raw_dir in path_value.split(os.pathsep):
+            if not raw_dir:
+                continue
+            directory = Path(raw_dir)
+            if not directory.is_dir():
+                continue
+            try:
+                for entry in directory.iterdir():
+                    if not entry.is_file():
+                        continue
+                    suffix = entry.suffix.lower()
+                    if suffix and suffix in extensions:
+                        names.add(entry.stem)
+                        names.add(entry.name)
+            except OSError:
+                continue
+
+        _PATH_COMMAND_CACHE[cache_key] = sorted(names, key=str.lower)
+        return _PATH_COMMAND_CACHE[cache_key]
 
     def translate(self, command_line: str, session: SessionState) -> CommandPlan | None:
         stripped = command_line.strip()
         if not stripped:
             return None
 
-        tokens = self._parser.parse(stripped)
+        try:
+            tokens = self._parser.parse(stripped)
+        except UserFacingError:
+            return self._plan_powershell(stripped, stripped, support_level="fallback_supported")
         if not tokens:
             return None
 
-        if any(token in {"|", ">", ">>", "<", "&&", "||", ";"} for token in tokens):
-            raise UserFacingError("Pipelines, redirects, and chained shell syntax are not supported in this PSux version.")
+        if self._contains_unsupported_shell_operators(tokens):
+            raise UserFacingError("Redirects and chained shell syntax are not supported yet. Only simple pipelines with | are currently supported.")
 
+        if "|" in tokens:
+            return self._translate_pipeline(tokens, stripped, session)
+
+        return self._translate_single_command(tokens, stripped, session)
+
+    def _translate_single_command(self, tokens: list[str], display: str, session: SessionState) -> CommandPlan:
         command = tokens[0]
+
+        if command in self._special_handlers:
+            return self._special_handlers[command](tokens, display, session)
+
+        if command in self._linux_handlers:
+            return self._linux_handlers[command](tokens, display, session)
+
+        if command == "git":
+            return self._translate_git(tokens, display, session)
+
         if command.startswith("./"):
-            return self._translate_local_executable(tokens, stripped, session)
+            return self._translate_local_executable(tokens, display, session)
 
-        handler = self._handlers.get(command)
-        if handler is not None:
-            return handler(tokens, stripped, session)
+        return self._plan_powershell(display, display, support_level="fallback_supported")
 
-        return self._translate_fallback_executable(tokens, stripped, session)
+    def _contains_unsupported_shell_operators(self, tokens: list[str]) -> bool:
+        return any(token in {">", ">>", "<", "&&", "||", ";"} for token in tokens)
+
+    def _translate_pipeline(self, tokens: list[str], display: str, session: SessionState) -> CommandPlan:
+        segments: list[list[str]] = []
+        current: list[str] = []
+
+        for token in tokens:
+            if token == "|":
+                if not current:
+                    raise UserFacingError("Invalid pipeline syntax near '|'.")
+                segments.append(current)
+                current = []
+                continue
+            current.append(token)
+
+        if not current:
+            raise UserFacingError("Invalid pipeline syntax near '|'.")
+        segments.append(current)
+
+        notes: list[str] = []
+        support_level = "fully_supported"
+        stage_scripts: list[str] = []
+
+        for segment in segments:
+            segment_display = " ".join(segment)
+            plan = self._translate_single_command(segment, segment_display, session)
+            if plan.kind == "internal":
+                raise UserFacingError("Pipelines are not supported with PSux internal commands like cd, export, clear, or history.")
+            stage_scripts.append(self._pipeline_stage_script(plan))
+            if plan.compatibility_note:
+                notes.append(plan.compatibility_note)
+            support_level = self._merge_support_level(support_level, plan.support_level)
+
+        script = " | ".join(stage_scripts)
+        compatibility_note = "\n".join(dict.fromkeys(notes)) if notes else None
+        return self._plan_powershell(
+            display,
+            script,
+            support_level=support_level,
+            compatibility_note=compatibility_note,
+        )
+
+    def _pipeline_stage_script(self, plan: CommandPlan) -> str:
+        if plan.kind == "powershell":
+            return f"& {{ {plan.powershell_script or ''} }}"
+        if plan.kind == "native":
+            arguments = ", ".join(quote_powershell(argument) for argument in plan.arguments)
+            return f"& {quote_powershell(plan.executable or '')} @({arguments})"
+        if plan.kind == "batch":
+            arguments = ", ".join(quote_powershell(argument) for argument in [plan.executable or "", *plan.arguments])
+            return f"& 'cmd.exe' @('/c', {arguments})"
+        raise UserFacingError(f"Unsupported command kind in pipeline: {plan.kind}")
+
+    def _merge_support_level(self, current: str, new: str) -> str:
+        order = {
+            "fully_supported": 0,
+            "partially_supported": 1,
+            "fallback_supported": 2,
+        }
+        return new if order.get(new, 99) > order.get(current, 99) else current
 
     def _plan_powershell(
         self,
@@ -223,6 +387,18 @@ class CommandTranslator:
             raise UserFacingError("cd: too many arguments.")
         return self._plan_internal(display, "cd", {"path": target})
 
+    def _translate_set_location(self, tokens: list[str], display: str, session: SessionState) -> CommandPlan:
+        remaining = tokens[1:]
+        if not remaining:
+            target = "~"
+        elif len(remaining) == 1:
+            target = remaining[0]
+        elif len(remaining) == 2 and remaining[0] in {"-Path", "-LiteralPath"}:
+            target = remaining[1]
+        else:
+            raise UserFacingError("Set-Location: expected a path or Set-Location -Path <path>.")
+        return self._plan_internal(display, "cd", {"path": target})
+
     def _translate_mkdir(self, tokens: list[str], display: str, session: SessionState) -> CommandPlan:
         if len(tokens) < 2:
             raise UserFacingError("mkdir: missing operand.")
@@ -301,8 +477,7 @@ foreach ($path in $paths) {{
 
         if recursive and not targets:
             targets = ["."]
-        if not recursive and not targets:
-            raise UserFacingError("grep: expected at least one file. Use grep -r ... to search the current directory recursively.")
+        stdin_mode = not recursive and not targets
 
         formatter = (
             "\"{0}:{1}:{2}\" -f $_.Path, $_.LineNumber, $_.Line.TrimEnd()"
@@ -316,6 +491,33 @@ foreach ($path in $paths) {{
         )
         case_sensitive_flag = "" if ignore_case else "$params.CaseSensitive = $true"
         recursive_literal = "$true" if recursive else "$false"
+        stdin_formatter = (
+            "\"{0}:{1}\" -f $lineNumber, $line.TrimEnd()"
+            if line_numbers
+            else "$line.TrimEnd()"
+        )
+        if stdin_mode:
+            script = f"""
+$pattern = {quote_powershell(pattern)}
+$lineNumber = 0
+foreach ($line in $input) {{
+    $lineNumber += 1
+    if ($pattern.Length -eq 0) {{
+        {stdin_formatter}
+        continue
+    }}
+    $params = @{{
+        Pattern = $pattern
+        InputObject = [string]$line
+    }}
+    {case_sensitive_flag}
+    if (Select-String @params) {{
+        {stdin_formatter}
+    }}
+}}
+""".strip()
+            return self._plan_powershell(display, script)
+
         script = f"""
 $pattern = {quote_powershell(pattern)}
 $targets = @({self._quote_array(targets)})
