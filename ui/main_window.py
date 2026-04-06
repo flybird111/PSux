@@ -103,7 +103,7 @@ class MainWindow(QMainWindow):
         dialog = QuickCommandsDialog(
             self.quick_commands_manager,
             insert_handler=self._insert_quick_command,
-            execute_handler=self._execute_quick_command,
+            execute_handler=self._execute_quick_command_lines,
             parent=self,
         )
         dialog.exec()
@@ -116,8 +116,11 @@ class MainWindow(QMainWindow):
         pane.set_command_text(command)
 
     def _execute_quick_command(self, command: str) -> None:
+        self._execute_quick_command_lines([command])
+
+    def _execute_quick_command_lines(self, commands: list[str]) -> None:
         pane = self.workspace_tabs.active_pane
         if not is_qobject_alive(pane):
             QMessageBox.information(self, "Quick Commands", "Open or focus a terminal pane first.")
             return
-        pane.execute_command_text(command)
+        pane.execute_command_lines(commands)

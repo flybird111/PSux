@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
@@ -31,6 +33,7 @@ class TerminalPane(QFrame):
         self._executor = executor
         self.session = session or SessionState()
         self._worker: CommandWorker | None = None
+        self._pending_commands: deque[str] = deque()
         self._completion_engine = CompletionEngine(self.session, lambda: self._translator.available_commands(self.session))
 
         self.setObjectName("terminalPane")
@@ -154,44 +157,34 @@ class TerminalPane(QFrame):
         self.focus_command_input()
 
     def execute_command_text(self, command: str) -> None:
-        self.set_command_text(command)
-        self.run_current_command()
+        self.enqueue_commands([command], focus_when_done=True)
+
+    def execute_command_lines(self, commands: list[str]) -> None:
+        self.enqueue_commands(commands, focus_when_done=True)
+
+    def enqueue_commands(self, commands: list[str], focus_when_done: bool = True) -> None:
+        normalized = [command.strip() for command in commands if command.strip()]
+        if not normalized:
+            return
+        for command in normalized:
+            self._pending_commands.append(command)
+        if len(normalized) > 1:
+            self.append_info(f"Queued {len(normalized)} commands.")
+        if focus_when_done:
+            self.focus_command_input()
+        self._start_next_command()
 
     def run_current_command(self) -> None:
         if not is_qobject_alive(self) or not is_qobject_alive(self.terminal_view):
             return
         self._emit_activated()
-        if self.session.busy:
-            self.append_error("A command is already running in this pane.")
-            return
 
         command = self.terminal_view.current_command().strip()
         if not command:
             return
 
-        self.session.history.add(command)
-        prompt_parts = build_prompt_parts(self.session.cwd)
         self.terminal_view.clear_command()
-        if is_qobject_alive(self.terminal_view.transcript):
-            self.terminal_view.transcript.append_command(prompt_parts, command)
-
-        try:
-            plan = self._translator.translate(command, self.session)
-        except UserFacingError as exc:
-            self.append_error(str(exc))
-            return
-
-        if plan is None:
-            return
-
-        if plan.compatibility_note:
-            self.append_info(plan.compatibility_note)
-
-        if plan.kind == "internal":
-            self._execute_internal(plan)
-            return
-
-        self._run_external(plan)
+        self.enqueue_commands([command], focus_when_done=False)
 
     def _execute_internal(self, plan) -> None:
         if not is_qobject_alive(self):
@@ -232,10 +225,21 @@ class TerminalPane(QFrame):
             self.session.cwd,
             self.session.get_effective_env(),
         )
+        worker.output_received.connect(self._handle_execution_output)
         worker.completed.connect(self._handle_execution_result)
         worker.finished.connect(worker.deleteLater)
         self._worker = worker
         worker.start()
+
+    def _handle_execution_output(self, text: str, is_stderr: bool) -> None:
+        if not text or not is_qobject_alive(self) or not is_qobject_alive(self.terminal_view):
+            return
+        if not is_qobject_alive(self.terminal_view.transcript):
+            return
+        if is_stderr:
+            self.terminal_view.transcript.append_stream_error(text)
+        else:
+            self.terminal_view.transcript.append_stream_output(text)
 
     def _handle_execution_result(self, result: ExecutionResult) -> None:
         if not is_qobject_alive(self):
@@ -246,16 +250,14 @@ class TerminalPane(QFrame):
         if is_qobject_alive(self.terminal_view):
             self.terminal_view.set_busy(False)
 
-        if result.stdout and is_qobject_alive(self.terminal_view) and is_qobject_alive(self.terminal_view.transcript):
-            self.terminal_view.transcript.append_output(result.stdout)
-        if result.stderr and is_qobject_alive(self.terminal_view) and is_qobject_alive(self.terminal_view.transcript):
-            self.terminal_view.transcript.append_error(result.stderr)
         if result.exit_code != 0 and not result.stderr and is_qobject_alive(self.terminal_view) and is_qobject_alive(self.terminal_view.transcript):
             self.terminal_view.transcript.append_error(f"Command exited with code {result.exit_code}.")
 
         self.update_prompt()
-        self.focus_command_input()
         self._worker = None
+        self._start_next_command()
+        if not self.session.busy:
+            self.focus_command_input()
 
     def mousePressEvent(self, event) -> None:
         super().mousePressEvent(event)
@@ -274,3 +276,34 @@ class TerminalPane(QFrame):
             chunk = candidates[index : index + columns]
             rows.append("".join(candidate.ljust(width) for candidate in chunk).rstrip())
         self.append_info("\n".join(rows))
+
+    def _start_next_command(self) -> None:
+        if not is_qobject_alive(self) or self.session.busy or not self._pending_commands:
+            return
+
+        command = self._pending_commands.popleft()
+        self.session.history.add(command)
+        prompt_parts = build_prompt_parts(self.session.cwd)
+        if is_qobject_alive(self.terminal_view) and is_qobject_alive(self.terminal_view.transcript):
+            self.terminal_view.transcript.append_command(prompt_parts, command)
+
+        try:
+            plan = self._translator.translate(command, self.session)
+        except UserFacingError as exc:
+            self.append_error(str(exc))
+            self._start_next_command()
+            return
+
+        if plan is None:
+            self._start_next_command()
+            return
+
+        if plan.compatibility_note:
+            self.append_info(plan.compatibility_note)
+
+        if plan.kind == "internal":
+            self._execute_internal(plan)
+            self._start_next_command()
+            return
+
+        self._run_external(plan)

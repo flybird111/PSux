@@ -119,6 +119,11 @@ class TerminalTranscript(QTextEdit):
         normalized = text if text.endswith("\n") else f"{text}\n"
         self.append_segments([(normalized, color)])
 
+    def append_stream(self, text: str, color: str) -> None:
+        if not text:
+            return
+        self.append_segments([(text, color)])
+
     def append_command(self, prompt_parts: tuple[str, str, str], command: str) -> None:
         app_name, path_text, marker = prompt_parts
         self.append_segments(
@@ -141,6 +146,12 @@ class TerminalTranscript(QTextEdit):
 
     def append_info(self, text: str) -> None:
         self.append_block(text, "#8fbafc")
+
+    def append_stream_output(self, text: str) -> None:
+        self.append_stream(text, "#eef2f7")
+
+    def append_stream_error(self, text: str) -> None:
+        self.append_stream(text, "#ff8e7c")
 
 
 class TerminalView(QWidget):
