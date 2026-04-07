@@ -729,17 +729,27 @@ else {{
         targets = tokens[1:]
         if not targets:
             raise UserFacingError("less: expected at least one file.")
-        script = f"""
-foreach ($target in @({self._quote_array(targets)})) {{
-    Start-Process -FilePath 'notepad.exe' -ArgumentList @($target)
-}}
-""".strip()
-        return self._plan_powershell(
-            display,
-            script,
-            support_level="partially_supported",
-            compatibility_note="less compatibility mode opens the target in Notepad instead of a real interactive pager.",
-        )
+        less_executable = self._command_on_path("less", session)
+        if less_executable:
+            return self._plan_native(
+                display,
+                less_executable,
+                targets,
+                support_level="fallback_supported",
+                compatibility_note="less is being passed through to the system executable found on PATH.",
+            )
+
+        more_executable = self._command_on_path("more.com", session) or self._command_on_path("more", session)
+        if more_executable:
+            return self._plan_native(
+                display,
+                more_executable,
+                targets,
+                support_level="partially_supported",
+                compatibility_note="less compatibility mode runs the Windows more pager instead of opening Notepad.",
+            )
+
+        raise UserFacingError("less is not available on PATH, and no compatible pager was found.")
 
     def _translate_wc(self, tokens: list[str], display: str, session: SessionState) -> CommandPlan:
         flags, paths = self._parse_combined_short_flags("wc", tokens[1:], {"l", "w", "c"})

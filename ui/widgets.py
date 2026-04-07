@@ -167,7 +167,12 @@ class TerminalView(QWidget):
     ) -> None:
         super().__init__(parent)
         self.transcript = TerminalTranscript()
+        self.running_label = QLabel()
         self.prompt_label = QLabel()
+        self.prompt_row = QWidget()
+        self.prompt_row.setObjectName("promptRow")
+        self.running_label.setObjectName("runningLabel")
+        self.running_label.hide()
         self.prompt_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.input = HistoryLineEdit(history, completion_provider=completion_provider)
         self.input.execute_requested.connect(self.execute_requested.emit)
@@ -183,16 +188,15 @@ class TerminalView(QWidget):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(0)
 
-        prompt_row = QWidget()
-        prompt_row.setObjectName("promptRow")
-        prompt_layout = QHBoxLayout(prompt_row)
+        prompt_layout = QHBoxLayout(self.prompt_row)
         prompt_layout.setContentsMargins(0, 6, 0, 0)
         prompt_layout.setSpacing(8)
         prompt_layout.addWidget(self.prompt_label, 0)
         prompt_layout.addWidget(self.input, 1)
+        prompt_layout.addWidget(self.running_label, 1)
 
         root.addWidget(self.transcript, 1)
-        root.addWidget(prompt_row, 0)
+        root.addWidget(self.prompt_row, 0)
 
         self.setObjectName("terminalView")
         self.setStyleSheet(
@@ -205,6 +209,9 @@ class TerminalView(QWidget):
             QWidget#promptRow {
                 background-color: #11131a;
             }
+            QWidget#promptRow[busy="true"] {
+                border-top: 1px solid #262c35;
+            }
             QTextEdit {
                 background-color: #11131a;
                 color: #eef2f7;
@@ -215,6 +222,9 @@ class TerminalView(QWidget):
             QLabel {
                 color: #67d4ff;
                 padding: 0px;
+            }
+            QLabel#runningLabel {
+                color: #f7b955;
             }
             QLineEdit {
                 background-color: #11131a;
@@ -251,13 +261,27 @@ class TerminalView(QWidget):
             self.transcript.clear()
 
     def focus_input(self) -> None:
-        if not is_qobject_alive(self.input):
+        if (
+            not is_qobject_alive(self.input)
+            or not self.input.isEnabled()
+            or not self.input.isVisible()
+        ):
             return
         self.input.setFocus(Qt.ShortcutFocusReason)
         if is_qobject_alive(self.input):
             self.input.deselect()
         self.activated.emit()
 
-    def set_busy(self, busy: bool) -> None:
+    def set_busy(self, busy: bool, command: str | None = None) -> None:
         if is_qobject_alive(self.input):
             self.input.setEnabled(not busy)
+            self.input.setVisible(not busy)
+        if is_qobject_alive(self.prompt_label):
+            self.prompt_label.setVisible(not busy)
+        if is_qobject_alive(self.running_label):
+            self.running_label.setVisible(busy)
+            self.running_label.setText(f"running: {command}" if busy and command else "running")
+        if is_qobject_alive(self.prompt_row):
+            self.prompt_row.setProperty("busy", busy)
+            self.prompt_row.style().unpolish(self.prompt_row)
+            self.prompt_row.style().polish(self.prompt_row)
