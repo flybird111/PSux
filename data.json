@@ -1,0 +1,25 @@
+{
+  "groups": [
+    {
+      "id": "ad16f1e1b00a4bd4a3717a487f83ea35",
+      "name": "test",
+      "items": [
+        {
+          "id": "ec9900b1e8b140c3a5bc7e5462a53912",
+          "name": "git log",
+          "commands": [
+            {
+              "id": "bc58eccbb8524b14a0b48b3a2cacc7ad",
+              "command": "git log"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "f06fd84621a44819953bcbf7615bd0e2",
+      "name": "test1",
+      "items": []
+    }
+  ]
+}
