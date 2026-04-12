@@ -1,24 +1,67 @@
 {
   "groups": [
     {
-      "id": "ad16f1e1b00a4bd4a3717a487f83ea35",
+      "id": "49d6198473914168b70b76829cdadfb7",
       "name": "test",
       "items": [
         {
-          "id": "ec9900b1e8b140c3a5bc7e5462a53912",
-          "name": "git log",
+          "id": "5b449c716c7c4460874e461e0b26882b",
+          "name": "顶顶顶",
+          "commands": []
+        }
+      ]
+    },
+    {
+      "id": "1c2523ea86374a14ad7e30d799c63f53",
+      "name": "1112",
+      "items": [
+        {
+          "id": "77506a638c2c4097a9625c30a8724686",
+          "name": "222",
           "commands": [
             {
-              "id": "bc58eccbb8524b14a0b48b3a2cacc7ad",
-              "command": "git log"
+              "id": "41c3e82dd39c4f76a9b4c579c4b51954",
+              "command": "ls\ngit log"
             }
           ]
         }
       ]
     },
     {
-      "id": "f06fd84621a44819953bcbf7615bd0e2",
-      "name": "test1",
+      "id": "339156a8e1cd4d7da04f645600e93df3",
+      "name": "111",
+      "items": [
+        {
+          "id": "307b547cd5304b88bfa7c16bc48dbd91",
+          "name": "99",
+          "commands": []
+        },
+        {
+          "id": "7598ccb7d50041e88f873aa800a3f256",
+          "name": "2",
+          "commands": [
+            {
+              "id": "8d968418f9334a8aa9efb97c2238b779",
+              "command": "ls\ngit log"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "993b1465cb0b42dc83afc8dd5e6797c4",
+      "name": "ddd",
+      "items": [
+        {
+          "id": "43aec83524ab4aaaa6dda89beb937195",
+          "name": "rrr",
+          "commands": []
+        }
+      ]
+    },
+    {
+      "id": "f2def8b0bc2246ca80c86ea43f695d81",
+      "name": "顶顶顶",
       "items": []
     }
   ]

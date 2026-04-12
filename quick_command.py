@@ -7,24 +7,55 @@ import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
+import time
+import traceback
+import types
 import uuid
 from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
-
-import customtkinter as ctk
-import pyte
-from pyte.screens import wcwidth
-from winpty import PtyProcess
-
-
-ctk.set_appearance_mode("System")
-ctk.set_default_color_theme("blue")
 
 
 def app_directory() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def startup_log_path() -> str:
+    return os.path.join(app_directory(), "quick_command.startup.log")
+
+
+def write_startup_log(message: str) -> None:
+    try:
+        with open(startup_log_path(), "a", encoding="utf-8") as file:
+            file.write(message.rstrip() + "\n")
+    except Exception:
+        pass
+
+
+write_startup_log("module import: stdlib ready")
+
+# Work around darkdetect blocking on Windows WMI queries during customtkinter import.
+darkdetect_stub = types.ModuleType("darkdetect")
+darkdetect_stub.theme = lambda: "Dark"
+darkdetect_stub.isDark = lambda: True
+darkdetect_stub.isLight = lambda: False
+darkdetect_stub.listener = lambda callback: None
+sys.modules.setdefault("darkdetect", darkdetect_stub)
+write_startup_log("module import: darkdetect stub installed")
+
+import customtkinter as ctk
+write_startup_log("module import: customtkinter ready")
+import pyte
+write_startup_log("module import: pyte ready")
+from pyte.screens import wcwidth
+from winpty import PtyProcess
+write_startup_log("module import: winpty ready")
+
+
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+write_startup_log("module import: customtkinter theme configured")
 
 
 class DataStore:
@@ -116,7 +147,22 @@ class DataStore:
         temp_path = f"{self.file_path}.tmp"
         with open(temp_path, "w", encoding="utf-8") as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
-        os.replace(temp_path, self.file_path)
+
+        for _ in range(5):
+            try:
+                os.replace(temp_path, self.file_path)
+                return
+            except PermissionError:
+                time.sleep(0.1)
+
+        try:
+            with open(self.file_path, "w", encoding="utf-8") as file:
+                json.dump(data, file, ensure_ascii=False, indent=2)
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 class SingleLineDialog(ctk.CTkToplevel):
@@ -198,7 +244,7 @@ class CommandDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             container,
             text="PowerShell Command",
-            font=ctk.CTkFont(size=16, weight="bold"),
+            font=ctk.CTkFont(size=15, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
 
@@ -246,16 +292,18 @@ class CommandDialog(ctk.CTkToplevel):
 
 
 class EmbeddedTerminal(ctk.CTkFrame):
-    def __init__(self, master: ctk.CTkFrame, on_activate) -> None:
+    def __init__(self, master: ctk.CTkFrame, on_activate, initial_cwd: Optional[str] = None) -> None:
         super().__init__(master, corner_radius=10, fg_color=("#f4f6f8", "#11161e"))
         self.on_activate = on_activate
         self.pty_process: Optional[PtyProcess] = None
         self.output_queue: "queue.Queue[str]" = queue.Queue()
         self.reader_thread: Optional[threading.Thread] = None
         self.after_id: Optional[str] = None
+        self.interrupt_after_id: Optional[str] = None
+        self.resize_after_id: Optional[str] = None
         self.connected = False
         self.current_input = ""
-        self.current_directory = os.getcwd()
+        self.current_directory = initial_cwd or os.getcwd()
         self.previous_directory: Optional[str] = None
         self.prompt_pattern = re.compile(r"PS\s+(.+?)>\s*$")
         self.tail_buffer = ""
@@ -305,6 +353,13 @@ class EmbeddedTerminal(ctk.CTkFrame):
         self.text_widget.bind("<Control-V>", self.on_paste)
         self.text_widget.bind("<Control-c>", self.on_ctrl_c)
         self.text_widget.bind("<Control-C>", self.on_ctrl_c)
+        self.text_widget.bind("<Button-3>", self.show_context_menu)
+
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Copy", command=self.copy_selection)
+        self.context_menu.add_command(label="Paste", command=lambda: self.on_paste(None))
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Interrupt", command=lambda: self.on_ctrl_c(None))
 
         self.reset_screen()
         self.start_shell()
@@ -326,6 +381,8 @@ class EmbeddedTerminal(ctk.CTkFrame):
 
     def shell_bootstrap_command(self) -> str:
         return (
+            "$env:PAGER = ''; "
+            "$env:GIT_PAGER = ''; "
             "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); "
             "$ProgressPreference = 'SilentlyContinue'; "
             "try { Import-Module PSReadLine -ErrorAction Stop | Out-Null; "
@@ -340,6 +397,14 @@ class EmbeddedTerminal(ctk.CTkFrame):
         argv.extend(["-NoExit", "-Command", self.shell_bootstrap_command()])
         return argv
 
+    def build_shell_env(self) -> Dict[str, str]:
+        env = os.environ.copy()
+        env.setdefault("TERM", "xterm-256color")
+        env.setdefault("COLORTERM", "truecolor")
+        env["PAGER"] = ""
+        env["GIT_PAGER"] = ""
+        return env
+
     def reset_screen(self) -> None:
         self.screen = pyte.HistoryScreen(self.columns, self.rows, 4000)
         self.stream = pyte.Stream(self.screen)
@@ -350,11 +415,15 @@ class EmbeddedTerminal(ctk.CTkFrame):
         self.reset_screen()
         self.current_input = ""
         self.is_command_line_mode = True
-        self.pty_process = PtyProcess.spawn(self.build_shell_args(), dimensions=(self.rows, self.columns))
+        self.pty_process = PtyProcess.spawn(
+            self.build_shell_args(),
+            cwd=self.current_directory,
+            env=self.build_shell_env(),
+            dimensions=(self.rows, self.columns),
+        )
         self.connected = True
         self.reader_thread = threading.Thread(target=self.reader_loop, daemon=True)
         self.reader_thread.start()
-        self.text_widget.focus_set()
 
     def stop_shell(self) -> None:
         if self.pty_process is not None:
@@ -521,6 +590,15 @@ class EmbeddedTerminal(ctk.CTkFrame):
                 self.pty_process.setwinsize(self.rows, self.columns)
             except Exception:
                 pass
+        if self.resize_after_id is not None:
+            try:
+                self.after_cancel(self.resize_after_id)
+            except Exception:
+                pass
+        self.resize_after_id = self.after(25, self.apply_resize)
+
+    def apply_resize(self) -> None:
+        self.resize_after_id = None
         self.screen.resize(lines=self.rows, columns=self.columns)
         self.render_screen()
 
@@ -530,28 +608,75 @@ class EmbeddedTerminal(ctk.CTkFrame):
         except Exception:
             selected = ""
         if selected:
-            self.clipboard_clear()
-            self.clipboard_append(selected)
+            self.copy_selection()
             return "break"
         self.current_input = ""
         self.is_command_line_mode = False
-        self.write_text("\x03")
+        if self.pty_process is not None:
+            try:
+                self.pty_process.sendintr()
+            except Exception:
+                pass
+            self.write_text("\x03")
+        else:
+            self.write_text("\x03")
+        if self.interrupt_after_id is not None:
+            try:
+                self.after_cancel(self.interrupt_after_id)
+            except Exception:
+                pass
+        self.interrupt_after_id = self.after(700, self.ensure_interrupt_completed)
+        return "break"
+
+    def ensure_interrupt_completed(self) -> None:
+        self.interrupt_after_id = None
+        if self.is_command_line_mode or self.pty_process is None:
+            return
+        self.restart_shell()
+
+    def copy_selection(self) -> None:
+        try:
+            selected = self.text_widget.selection_get()
+        except Exception:
+            selected = ""
+        if selected:
+            self.clipboard_clear()
+            self.clipboard_append(selected)
+
+    def show_context_menu(self, event: tk.Event) -> str:
+        self.on_activate()
+        self.text_widget.focus_set()
+        try:
+            has_selection = bool(self.text_widget.tag_ranges("sel"))
+        except Exception:
+            has_selection = False
+        self.context_menu.entryconfigure("Copy", state="normal" if has_selection else "disabled")
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
         return "break"
 
     def transform_command(self, command_text: str) -> str:
         lines: List[str] = []
         for line in command_text.split("\n"):
-            if line.strip() != "cd -":
-                lines.append(line)
+            stripped = line.strip()
+            if stripped == "cd -":
+                if self.previous_directory:
+                    escaped = self.previous_directory.replace("'", "''")
+                    lines.append(f"Set-Location -LiteralPath '{escaped}'")
+                else:
+                    lines.append("Write-Output 'No previous location.'")
                 continue
-            if self.previous_directory:
-                escaped = self.previous_directory.replace("'", "''")
-                lines.append(f"Set-Location -LiteralPath '{escaped}'")
-            else:
-                lines.append("Write-Output 'No previous location.'")
+
+            if re.match(r"^(git(?:\.exe)?\s+.*\blog\b.*)$", stripped, re.IGNORECASE) and "|" not in stripped:
+                lines.append(f"{line} | more")
+                continue
+
+            lines.append(line)
         return "\n".join(lines)
 
-    def _render_line_buffer(self, line_buffer: Dict[int, Any]) -> str:
+    def _render_line_buffer(self, line_buffer: Dict[int, Any], keep_until: Optional[int] = None) -> str:
         rendered: List[str] = []
         is_wide = False
         for x in range(self.columns):
@@ -561,19 +686,39 @@ class EmbeddedTerminal(ctk.CTkFrame):
             char = line_buffer[x].data
             is_wide = wcwidth(char[0]) == 2 if char else False
             rendered.append(char)
-        return "".join(rendered).rstrip()
+        text = "".join(rendered)
+        if keep_until is not None:
+            keep_until = max(0, min(keep_until, len(text)))
+            trimmed = text[:keep_until]
+            return trimmed if trimmed else ""
+        return text.rstrip()
+
+    def _render_display_line(self, line: str, is_cursor_line: bool, cursor_col: int) -> str:
+        if is_cursor_line:
+            cursor_col = max(0, min(cursor_col, len(line)))
+            return line[:cursor_col]
+        return line.rstrip()
+
+    def _is_view_scrolled_to_bottom(self) -> bool:
+        try:
+            first, last = self.text_widget.yview()
+        except Exception:
+            return True
+        return last >= 0.999 or first <= 0.0 and last >= 0.999
 
     def render_screen(self) -> None:
         history_lines = [self._render_line_buffer(line) for line in self.screen.history.top]
-        visible_lines = [line.rstrip() for line in self.screen.display]
-
-        while visible_lines and visible_lines[-1] == "":
-            visible_lines.pop()
-        if not visible_lines:
-            visible_lines = [""]
+        cursor_row = getattr(self.screen.cursor, "y", 0)
+        cursor_col = getattr(self.screen.cursor, "x", 0)
+        visible_lines = [
+            self._render_display_line(line, row == cursor_row, cursor_col)
+            for row, line in enumerate(self.screen.display)
+        ]
 
         lines = history_lines + visible_lines
         content = "\n".join(lines)
+        at_bottom = self._is_view_scrolled_to_bottom()
+        current_view = self.text_widget.yview()
 
         self.tail_buffer = content[-2048:]
         prompt_match = self.prompt_pattern.search(self.tail_buffer)
@@ -589,10 +734,15 @@ class EmbeddedTerminal(ctk.CTkFrame):
         self.text_widget.delete("1.0", "end")
         self.text_widget.insert("1.0", content)
 
-        cursor_row = len(history_lines) + getattr(self.screen.cursor, "y", 0) + 1
-        cursor_col = getattr(self.screen.cursor, "x", 0)
-        self.text_widget.mark_set("insert", f"{max(cursor_row, 1)}.{cursor_col}")
-        self.text_widget.see("insert")
+        insert_row = len(history_lines) + cursor_row + 1
+        self.text_widget.mark_set("insert", f"{max(insert_row, 1)}.{cursor_col}")
+        if at_bottom:
+            self.text_widget.see("insert")
+        else:
+            try:
+                self.text_widget.yview_moveto(current_view[0])
+            except Exception:
+                self.text_widget.see("insert")
 
     def on_paste(self, _event: tk.Event) -> str:
         try:
@@ -663,12 +813,22 @@ class EmbeddedTerminal(ctk.CTkFrame):
                 self.after_cancel(self.after_id)
             except Exception:
                 pass
+        if self.interrupt_after_id is not None:
+            try:
+                self.after_cancel(self.interrupt_after_id)
+            except Exception:
+                pass
+        if self.resize_after_id is not None:
+            try:
+                self.after_cancel(self.resize_after_id)
+            except Exception:
+                pass
         self.stop_shell()
         super().destroy()
 
 
 class TerminalHost(ctk.CTkFrame):
-    def __init__(self, master: ctk.CTkFrame, workspace: "TerminalWorkspace") -> None:
+    def __init__(self, master: ctk.CTkFrame, workspace: "TerminalWorkspace", initial_cwd: Optional[str] = None) -> None:
         super().__init__(master, corner_radius=8)
         self.workspace = workspace
 
@@ -689,8 +849,21 @@ class TerminalHost(ctk.CTkFrame):
         ctk.CTkButton(button_box, text="Split V", width=72, command=lambda: self.workspace.split_active("vertical")).pack(side="left", padx=(0, 6))
         ctk.CTkButton(button_box, text="Close", width=70, fg_color="#c0392b", hover_color="#922b21", command=self.workspace.close_active).pack(side="left")
 
-        self.terminal = EmbeddedTerminal(self, on_activate=lambda: self.workspace.set_active_host(self))
-        self.terminal.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="nsew")
+        self.terminal = EmbeddedTerminal(self, on_activate=lambda: self.workspace.set_active_host(self), initial_cwd=initial_cwd)
+        self.terminal.grid(row=1, column=0, padx=8, pady=(0, 6), sticky="nsew")
+        self._bind_activate_events()
+
+    def _bind_activate_events(self) -> None:
+        def activate(_event: tk.Event) -> str:
+            self.workspace.set_active_host(self)
+            self.terminal.text_widget.focus_set()
+            return "break"
+
+        for widget in (self, self.title_label, self.terminal):
+            try:
+                widget.bind("<Button-1>", activate, add="+")
+            except Exception:
+                pass
 
     def set_active(self, active: bool) -> None:
         self.terminal.set_active(active)
@@ -710,8 +883,8 @@ class TerminalWorkspace(ctk.CTkFrame):
         self.mount_root(initial_host)
         self.set_active_host(initial_host)
 
-    def create_terminal_host(self, parent) -> TerminalHost:
-        return TerminalHost(parent, self)
+    def create_terminal_host(self, parent, initial_cwd: Optional[str] = None) -> TerminalHost:
+        return TerminalHost(parent, self, initial_cwd=initial_cwd)
 
     def mount_root(self, widget: tk.Widget) -> None:
         self.root_widget = widget
@@ -719,9 +892,58 @@ class TerminalWorkspace(ctk.CTkFrame):
 
     def _insert_into_parent(self, parent: tk.PanedWindow, index: int, widget: tk.Widget) -> None:
         try:
-            parent.insert(index, widget)
+            parent.add(widget, stretch="always")
         except Exception:
-            parent.add(widget)
+            try:
+                parent.add(widget, stretch="always")
+            except Exception:
+                parent.add(widget)
+
+    def _rebalance_panedwindow(self, pane: tk.PanedWindow) -> None:
+        try:
+            panes = pane.panes()
+        except Exception:
+            return
+        if len(panes) < 2:
+            return
+        try:
+            orient = str(pane.cget("orient")).lower()
+            pane.update_idletasks()
+            if orient.endswith("vertical"):
+                height = max(int(pane.winfo_height()), 2)
+                pane.sash_place(0, 0, max(height // 2, 1))
+            else:
+                width = max(int(pane.winfo_width()), 2)
+                pane.sash_place(0, max(width // 2, 1), 0)
+        except Exception:
+            pass
+
+    def _pane_index(self, parent: tk.PanedWindow, child: tk.Widget) -> Optional[int]:
+        target = str(child)
+        for index, pane in enumerate(parent.panes()):
+            if str(pane) == target:
+                return index
+        return None
+
+    def _find_pane_parent(self, target: tk.Widget) -> Tuple[Optional[tk.PanedWindow], Optional[int]]:
+        root = self.root_widget
+        if root is None:
+            return None, None
+
+        def walk(widget: tk.Widget) -> Tuple[Optional[tk.PanedWindow], Optional[int]]:
+            if isinstance(widget, tk.PanedWindow):
+                index = self._pane_index(widget, target)
+                if index is not None:
+                    return widget, index
+                for pane in widget.panes():
+                    found_parent, found_index = walk(widget.nametowidget(str(pane)))
+                    if found_parent is not None:
+                        return found_parent, found_index
+            return None, None
+
+        if target == root and isinstance(root, tk.PanedWindow):
+            return None, None
+        return walk(root)
 
     def replace_widget(self, old_widget: tk.Widget, new_widget: tk.Widget) -> None:
         if old_widget == self.root_widget:
@@ -732,8 +954,10 @@ class TerminalWorkspace(ctk.CTkFrame):
 
         parent = old_widget.master
         if isinstance(parent, tk.PanedWindow):
-            panes = list(parent.panes())
-            index = panes.index(str(old_widget))
+            index = self._pane_index(parent, old_widget)
+            if index is None:
+                parent.add(new_widget)
+                return
             parent.forget(old_widget)
             self._insert_into_parent(parent, index, new_widget)
 
@@ -752,7 +976,7 @@ class TerminalWorkspace(ctk.CTkFrame):
                 return
             if isinstance(widget, tk.PanedWindow):
                 for pane_name in widget.panes():
-                    walk(widget.nametowidget(pane_name))
+                    walk(widget.nametowidget(str(pane_name)))
             else:
                 for child in widget.winfo_children():
                     if isinstance(child, (TerminalHost, tk.PanedWindow)):
@@ -767,25 +991,46 @@ class TerminalWorkspace(ctk.CTkFrame):
             return
 
         old_host = self.active_host
-        parent = old_host.master
+        inherited_cwd = old_host.terminal.current_directory or os.getcwd()
+        parent, index = self._find_pane_parent(old_host)
 
         nested = tk.PanedWindow(
-            parent,
-            orient=tk.HORIZONTAL if orientation == "horizontal" else tk.VERTICAL,
+            parent if parent is not None else self,
+            orient=tk.VERTICAL if orientation == "horizontal" else tk.HORIZONTAL,
             sashrelief=tk.RAISED,
             sashwidth=6,
             bd=0,
             bg="#3a4150",
         )
 
-        self.replace_widget(old_host, nested)
+        if parent is None:
+            self.replace_widget(old_host, nested)
+        else:
+            parent.forget(old_host)
+            self._insert_into_parent(parent, index if index is not None else 0, nested)
+        first_host = self.create_terminal_host(nested, initial_cwd=inherited_cwd)
+        second_host = self.create_terminal_host(nested, initial_cwd=inherited_cwd)
 
-        old_host.pack_forget()
-        new_host = self.create_terminal_host(nested)
-
-        nested.add(old_host, stretch="always")
-        nested.add(new_host, stretch="always")
-        self.set_active_host(new_host)
+        nested.add(first_host, stretch="always")
+        nested.add(second_host, stretch="always")
+        try:
+            nested.paneconfigure(first_host, stretch="always")
+            nested.paneconfigure(second_host, stretch="always")
+        except Exception:
+            pass
+        try:
+            nested.update_idletasks()
+            (parent if parent is not None else self).update_idletasks()
+        except Exception:
+            pass
+        try:
+            if parent is not None:
+                self._rebalance_panedwindow(parent)
+            self._rebalance_panedwindow(nested)
+        except Exception:
+            pass
+        old_host.destroy()
+        self.set_active_host(second_host)
 
     def close_active(self) -> None:
         if self.active_host is None:
@@ -795,26 +1040,32 @@ class TerminalWorkspace(ctk.CTkFrame):
             return
 
         host = self.active_host
-        parent = host.master
+        parent, index = self._find_pane_parent(host)
         if not isinstance(parent, tk.PanedWindow):
             return
 
-        panes_before = list(parent.panes())
-        index = panes_before.index(str(host))
+        if index is None:
+            return
         parent.forget(host)
         host.destroy()
 
         remaining = list(parent.panes())
         if len(remaining) == 1:
-            survivor = parent.nametowidget(remaining[0])
-            self.replace_widget(parent, survivor)
-            parent.destroy()
+            survivor = parent.nametowidget(str(remaining[0]))
             if isinstance(survivor, TerminalHost):
                 self.set_active_host(survivor)
+            elif isinstance(survivor, tk.PanedWindow):
+                child_hosts = self.iter_hosts()
+                if child_hosts:
+                    self.set_active_host(child_hosts[0])
+            try:
+                self._rebalance_panedwindow(parent)
+            except Exception:
+                pass
             return
 
         next_index = min(index, len(remaining) - 1)
-        next_widget = parent.nametowidget(remaining[next_index])
+        next_widget = parent.nametowidget(str(remaining[next_index]))
         if isinstance(next_widget, TerminalHost):
             self.set_active_host(next_widget)
         elif isinstance(next_widget, tk.PanedWindow):
@@ -829,106 +1080,201 @@ class TerminalWorkspace(ctk.CTkFrame):
 
 
 class QuickCommandWindow(ctk.CTkToplevel):
+    TOKENS = {
+        "bg": "#1e1e1e",
+        "panel": "#252526",
+        "panel_alt": "#202020",
+        "panel_soft": "#2f2f33",
+        "border": "#3c3c3c",
+        "text": "#ffffff",
+        "text_dim": "#ffffff",
+        "muted": "#ffffff",
+        "accent": "#3794ff",
+        "accent_soft": "#094771",
+        "hover": "#2a2d2e",
+        "code_bg": "#1e1e1e",
+        "selected_text": "#ffffff",
+    }
+
     def __init__(self, app: "QuickCommandApp") -> None:
         super().__init__(app)
         self.app = app
         self.selected_group_id: Optional[str] = None
         self.selected_item_id: Optional[str] = None
+        self.selected_command_id: Optional[str] = None
 
         self.title("Quick Command")
-        self.geometry("1280x780")
-        self.minsize(1040, 640)
+        self.geometry("1180x720")
+        self.minsize(980, 620)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.configure(fg_color=self.TOKENS["bg"])
+
+        self.group_menu = tk.Menu(self, tearoff=0)
+        self.item_menu = tk.Menu(self, tearoff=0)
+        self.command_menu = tk.Menu(self, tearoff=0)
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.content_frame = ctk.CTkFrame(self, corner_radius=0)
-        self.content_frame.grid(row=0, column=0, sticky="nsew")
-        self.content_frame.grid_columnconfigure(0, weight=0)
-        self.content_frame.grid_columnconfigure(1, weight=0)
-        self.content_frame.grid_columnconfigure(2, weight=1)
-        self.content_frame.grid_rowconfigure(0, weight=1)
+        self.shell = ctk.CTkFrame(self, fg_color=self.TOKENS["bg"], corner_radius=0)
+        self.shell.grid(row=0, column=0, sticky="nsew")
+        self.shell.grid_columnconfigure(0, weight=0)
+        self.shell.grid_columnconfigure(1, weight=0)
+        self.shell.grid_columnconfigure(2, weight=1)
+        self.shell.grid_rowconfigure(1, weight=1)
 
-        self.group_panel = ctk.CTkFrame(self.content_frame, width=250)
-        self.group_panel.grid(row=0, column=0, padx=(12, 6), pady=12, sticky="nsew")
-        self.group_panel.grid_propagate(False)
-        self.group_panel.grid_columnconfigure(0, weight=1)
-        self.group_panel.grid_rowconfigure(1, weight=1)
-
-        self.item_panel = ctk.CTkFrame(self.content_frame, width=290)
-        self.item_panel.grid(row=0, column=1, padx=6, pady=12, sticky="nsew")
-        self.item_panel.grid_propagate(False)
-        self.item_panel.grid_columnconfigure(0, weight=1)
-        self.item_panel.grid_rowconfigure(1, weight=1)
-
-        self.command_panel = ctk.CTkFrame(self.content_frame)
-        self.command_panel.grid(row=0, column=2, padx=(6, 12), pady=12, sticky="nsew")
-        self.command_panel.grid_columnconfigure(0, weight=1)
-        self.command_panel.grid_rowconfigure(1, weight=1)
-
-        self.create_group_panel()
-        self.create_item_panel()
-        self.create_command_panel()
+        self.create_header()
+        self.create_columns()
+        self.configure_menus()
         self.restore_selection()
         self.refresh_all()
 
-    def create_group_panel(self) -> None:
-        header = ctk.CTkFrame(self.group_panel, fg_color="transparent")
-        header.grid(row=0, column=0, padx=12, pady=(12, 8), sticky="ew")
-        header.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(header, text="Groups", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(header, text="+ New", width=78, command=self.add_group).grid(row=0, column=1, sticky="e")
+    def debug_log(self, message: str) -> None:
+        try:
+            self.app.append_status(f"[QuickCommand] {message}")
+        except Exception:
+            pass
 
-        self.group_scroll = ctk.CTkScrollableFrame(self.group_panel, corner_radius=10)
-        self.group_scroll.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="nsew")
-        self.group_scroll.grid_columnconfigure(0, weight=1)
+    def describe_text(self, value: Any) -> str:
+        if value is None:
+            return "None"
+        if isinstance(value, str):
+            return f"repr={value!r} len={len(value)} stripped={value.strip()!r}"
+        return f"type={type(value).__name__} repr={value!r}"
 
-    def create_item_panel(self) -> None:
-        header = ctk.CTkFrame(self.item_panel, fg_color="transparent")
-        header.grid(row=0, column=0, padx=12, pady=(12, 8), sticky="ew")
-        header.grid_columnconfigure(0, weight=1)
+    def create_header(self) -> None:
+        header = ctk.CTkFrame(self.shell, fg_color=self.TOKENS["panel_alt"], corner_radius=0, height=32)
+        header.grid(row=0, column=0, columnspan=3, sticky="ew")
+        header.grid_columnconfigure(1, weight=1)
 
-        self.item_title = ctk.CTkLabel(header, text="Items", font=ctk.CTkFont(size=18, weight="bold"))
-        self.item_title.grid(row=0, column=0, sticky="w")
-        self.add_item_button = ctk.CTkButton(header, text="+ New", width=78, command=self.add_item)
-        self.add_item_button.grid(row=0, column=1, sticky="e")
+        ctk.CTkLabel(header, text="QUICK COMMAND", text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, padx=(10, 8), pady=5, sticky="w")
+        ctk.CTkLabel(header, text="Explorer / List / Preview", text_color=self.TOKENS["selected_text"], font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=1, pady=5, sticky="w")
 
-        self.item_scroll = ctk.CTkScrollableFrame(self.item_panel, corner_radius=10)
-        self.item_scroll.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="nsew")
-        self.item_scroll.grid_columnconfigure(0, weight=1)
+        toolbar = ctk.CTkFrame(header, fg_color=self.TOKENS["panel_alt"])
+        toolbar.grid(row=0, column=2, padx=10, pady=2, sticky="e")
+        self.header_new_group = self.make_action_button(toolbar, "New Group", self.add_group)
+        self.header_new_group.pack(side="left", padx=(0, 6))
+        self.header_new_item = self.make_action_button(toolbar, "New Item", self.add_item)
+        self.header_new_item.pack(side="left", padx=(0, 6))
+        self.header_new_command = self.make_action_button(toolbar, "New Cmd", self.add_command)
+        self.header_new_command.pack(side="left", padx=(0, 6))
+        self.header_run_all = self.make_action_button(toolbar, "Run All", self.run_all_commands)
+        self.header_run_all.pack(side="left")
 
-    def create_command_panel(self) -> None:
-        header = ctk.CTkFrame(self.command_panel, fg_color="transparent")
-        header.grid(row=0, column=0, padx=14, pady=(14, 8), sticky="ew")
-        header.grid_columnconfigure(0, weight=1)
+    def create_columns(self) -> None:
+        self.group_panel = self.make_panel(self.shell, 172)
+        self.group_panel.grid(row=1, column=0, padx=(8, 4), pady=8, sticky="nsew")
+        self.group_panel.grid_columnconfigure(0, weight=1)
+        self.group_panel.grid_rowconfigure(1, weight=1)
 
-        title_box = ctk.CTkFrame(header, fg_color="transparent")
-        title_box.grid(row=0, column=0, sticky="ew")
-        title_box.grid_columnconfigure(0, weight=1)
+        self.item_panel = self.make_panel(self.shell, 198)
+        self.item_panel.grid(row=1, column=1, padx=4, pady=8, sticky="nsew")
+        self.item_panel.grid_columnconfigure(0, weight=1)
+        self.item_panel.grid_rowconfigure(1, weight=1)
 
-        self.command_title = ctk.CTkLabel(title_box, text="Commands", font=ctk.CTkFont(size=22, weight="bold"), anchor="w")
+        self.command_panel = self.make_panel(self.shell, 0)
+        self.command_panel.grid(row=1, column=2, padx=(4, 8), pady=8, sticky="nsew")
+        self.command_panel.grid_columnconfigure(0, weight=1)
+        self.command_panel.grid_rowconfigure(2, weight=1)
+        self.command_panel.grid_rowconfigure(4, weight=1)
+
+        self.group_title = self.make_section_header(self.group_panel, "GROUPS", ("New", self.add_group))
+        self.group_scroll = self.make_scroll(self.group_panel)
+
+        self.item_title = self.make_section_header(self.item_panel, "ITEMS", ("New", self.add_item))
+        self.item_scroll = self.make_scroll(self.item_panel)
+
+        self.create_detail_section()
+
+    def create_detail_section(self) -> None:
+        title_wrap = ctk.CTkFrame(self.command_panel, fg_color=self.TOKENS["panel_alt"])
+        title_wrap.grid(row=0, column=0, padx=10, pady=(8, 3), sticky="ew")
+        title_wrap.grid_columnconfigure(0, weight=1)
+
+        self.command_title = ctk.CTkLabel(title_wrap, text="No Selection", text_color=self.TOKENS["text"], font=ctk.CTkFont(size=15, weight="bold"), anchor="w")
         self.command_title.grid(row=0, column=0, sticky="w")
 
-        self.command_subtitle = ctk.CTkLabel(title_box, text="Select a group and an item.", anchor="w", text_color=("gray35", "gray70"))
-        self.command_subtitle.grid(row=1, column=0, pady=(4, 0), sticky="w")
+        self.command_subtitle = ctk.CTkLabel(title_wrap, text="Choose a group and item to inspect commands.", text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=10), anchor="w")
+        self.command_subtitle.grid(row=1, column=0, pady=(2, 0), sticky="w")
 
-        action_box = ctk.CTkFrame(header, fg_color="transparent")
-        action_box.grid(row=0, column=1, rowspan=2, padx=(12, 0), sticky="e")
-        self.add_command_button = ctk.CTkButton(action_box, text="Add Command", width=120, command=self.add_command)
-        self.add_command_button.pack(side="left", padx=(0, 8))
-        self.run_all_button = ctk.CTkButton(action_box, text="Run All", width=120, command=self.run_all_commands)
-        self.run_all_button.pack(side="left")
+        actions = ctk.CTkFrame(title_wrap, fg_color=self.TOKENS["panel_alt"])
+        actions.grid(row=0, column=1, rowspan=2, sticky="e")
+        self.command_new_button = self.make_action_button(actions, "New Cmd", self.add_command)
+        self.command_new_button.pack(side="left", padx=(0, 6))
+        self.command_run_all_button = self.make_action_button(actions, "Run All", self.run_all_commands)
+        self.command_run_all_button.pack(side="left", padx=(0, 6))
+        self.command_run_button = self.make_action_button(actions, "Run", self.run_selected_command)
+        self.command_run_button.pack(side="left", padx=(0, 6))
+        self.command_copy_button = self.make_action_button(actions, "Copy", self.copy_selected_command)
+        self.command_copy_button.pack(side="left", padx=(0, 6))
+        self.command_edit_button = self.make_action_button(actions, "Edit", self.edit_selected_command)
+        self.command_edit_button.pack(side="left", padx=(0, 6))
+        self.command_delete_button = self.make_action_button(actions, "Delete", self.delete_selected_command)
+        self.command_delete_button.pack(side="left")
 
-        self.command_scroll = ctk.CTkScrollableFrame(self.command_panel, corner_radius=10)
-        self.command_scroll.grid(row=1, column=0, padx=14, pady=(0, 14), sticky="nsew")
+        list_header = ctk.CTkFrame(self.command_panel, fg_color=self.TOKENS["panel_alt"])
+        list_header.grid(row=1, column=0, padx=10, pady=(0, 3), sticky="ew")
+        ctk.CTkLabel(list_header, text="COMMANDS", text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=10, weight="bold")).pack(side="left")
+
+        self.command_scroll = ctk.CTkScrollableFrame(self.command_panel, fg_color=self.TOKENS["panel"], corner_radius=0)
+        self.command_scroll.grid(row=2, column=0, padx=8, pady=(0, 4), sticky="nsew")
         self.command_scroll.grid_columnconfigure(0, weight=1)
+
+        preview_header = ctk.CTkFrame(self.command_panel, fg_color=self.TOKENS["panel_alt"])
+        preview_header.grid(row=3, column=0, padx=10, pady=(0, 3), sticky="ew")
+        ctk.CTkLabel(preview_header, text="PREVIEW", text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=10, weight="bold")).pack(side="left")
+
+        preview_shell = ctk.CTkFrame(self.command_panel, fg_color=self.TOKENS["code_bg"], corner_radius=8)
+        preview_shell.grid(row=4, column=0, padx=8, pady=(0, 6), sticky="nsew")
+        preview_shell.grid_columnconfigure(0, weight=1)
+        preview_shell.grid_rowconfigure(0, weight=1)
+
+        self.command_preview = ctk.CTkTextbox(preview_shell, fg_color=self.TOKENS["code_bg"], text_color=self.TOKENS["selected_text"], border_width=0, font=ctk.CTkFont(family="Consolas", size=11), wrap="none")
+        self.command_preview.grid(row=0, column=0, sticky="nsew")
+        self.command_preview.configure(state="disabled")
+
+    def make_panel(self, parent, width: int) -> ctk.CTkFrame:
+        panel = ctk.CTkFrame(parent, fg_color=self.TOKENS["panel"], corner_radius=8, border_width=1, border_color=self.TOKENS["border"], width=width)
+        if width:
+            panel.grid_propagate(False)
+        return panel
+
+    def make_scroll(self, parent) -> ctk.CTkScrollableFrame:
+        scroll = ctk.CTkScrollableFrame(parent, fg_color=self.TOKENS["panel"], corner_radius=0)
+        scroll.grid(row=1, column=0, padx=5, pady=(0, 3), sticky="nsew")
+        scroll.grid_columnconfigure(0, weight=1)
+        return scroll
+
+    def make_section_header(self, parent, title: str, action: Tuple[str, Any]) -> ctk.CTkLabel:
+        header = ctk.CTkFrame(parent, fg_color=self.TOKENS["panel_alt"])
+        header.grid(row=0, column=0, padx=8, pady=(8, 2), sticky="ew")
+        header.grid_columnconfigure(0, weight=1)
+        label = ctk.CTkLabel(header, text=title, text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=10, weight="bold"))
+        label.grid(row=0, column=0, sticky="w")
+        self.make_action_button(header, action[0], action[1]).grid(row=0, column=1, sticky="e")
+        return label
+
+    def make_action_button(self, parent, text: str, command) -> ctk.CTkButton:
+        return ctk.CTkButton(parent, text=text, command=command, height=20, width=50, corner_radius=4, fg_color=self.TOKENS["panel_soft"], hover_color=self.TOKENS["hover"], text_color=self.TOKENS["selected_text"], border_width=0, font=ctk.CTkFont(size=10, weight="bold"))
+
+    def configure_menus(self) -> None:
+        self.group_menu.add_command(label="Rename Group", command=self.rename_selected_group)
+        self.group_menu.add_command(label="Delete Group", command=self.delete_selected_group)
+        self.item_menu.add_command(label="Rename Item", command=self.rename_selected_item)
+        self.item_menu.add_command(label="Delete Item", command=self.delete_selected_item)
+        self.command_menu.add_command(label="Run", command=self.run_selected_command)
+        self.command_menu.add_command(label="Copy", command=self.copy_selected_command)
+        self.command_menu.add_command(label="Edit", command=self.edit_selected_command)
+        self.command_menu.add_separator()
+        self.command_menu.add_command(label="Delete", command=self.delete_selected_command)
 
     def restore_selection(self) -> None:
         groups = self.app.data.get("groups", [])
+        self.debug_log(f"restore_selection groups={len(groups)} selected_group_id={self.selected_group_id!r} selected_item_id={self.selected_item_id!r} selected_command_id={self.selected_command_id!r}")
         if not groups:
             self.selected_group_id = None
             self.selected_item_id = None
+            self.selected_command_id = None
             return
 
         if not any(group["id"] == self.selected_group_id for group in groups):
@@ -937,24 +1283,48 @@ class QuickCommandWindow(ctk.CTkToplevel):
         group = self.get_selected_group()
         if not group:
             self.selected_item_id = None
+            self.selected_command_id = None
             return
 
         items = group.get("items", [])
         if not items:
             self.selected_item_id = None
+            self.selected_command_id = None
             return
 
         if not any(item["id"] == self.selected_item_id for item in items):
             self.selected_item_id = items[0]["id"]
+
+        item = self.get_selected_item()
+        if not item:
+            self.selected_command_id = None
+            return
+
+        commands = item.get("commands", [])
+        if not commands:
+            self.selected_command_id = None
+            return
+
+        if not any(command["id"] == self.selected_command_id for command in commands):
+            self.selected_command_id = commands[0]["id"]
 
     def refresh_all(self) -> None:
         self.restore_selection()
         self.render_groups()
         self.render_items()
         self.render_commands()
-        self.add_item_button.configure(state="normal" if self.get_selected_group() else "disabled")
-        self.add_command_button.configure(state="normal" if self.get_selected_item() else "disabled")
-        self.run_all_button.configure(state="normal" if self.get_selected_item() else "disabled")
+        has_group = self.get_selected_group() is not None
+        has_item = self.get_selected_item() is not None
+        has_command = self.get_selected_command() is not None
+        self.header_new_item.configure(state="normal" if has_group else "disabled")
+        self.header_new_command.configure(state="normal" if has_item else "disabled")
+        self.header_run_all.configure(state="normal" if has_item else "disabled")
+        self.command_new_button.configure(state="normal" if has_item else "disabled")
+        self.command_run_all_button.configure(state="normal" if has_item else "disabled")
+        self.command_run_button.configure(state="normal" if has_command else "disabled")
+        self.command_copy_button.configure(state="normal" if has_command else "disabled")
+        self.command_edit_button.configure(state="normal" if has_command else "disabled")
+        self.command_delete_button.configure(state="normal" if has_command else "disabled")
 
     def clear_frame(self, frame: ctk.CTkScrollableFrame) -> None:
         for child in frame.winfo_children():
@@ -975,6 +1345,15 @@ class QuickCommandWindow(ctk.CTkToplevel):
                 return item
         return None
 
+    def get_selected_command(self) -> Optional[Dict[str, Any]]:
+        item = self.get_selected_item()
+        if not item:
+            return None
+        for command in item.get("commands", []):
+            if command["id"] == self.selected_command_id:
+                return command
+        return None
+
     def find_item_and_parent(self, item_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         for group in self.app.data.get("groups", []):
             for item in group.get("items", []):
@@ -990,100 +1369,187 @@ class QuickCommandWindow(ctk.CTkToplevel):
                         return group, item, command
         return None, None, None
 
+    def show_menu(self, menu: tk.Menu, event: tk.Event) -> None:
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def select_group(self, group_id: str) -> None:
         self.selected_group_id = group_id
         group = self.get_selected_group()
+        self.debug_log(
+            f"select_group group_id={group_id!r} resolved_name={self.describe_text(group.get('name') if group else None)} items={len(group.get('items', [])) if group else 0}"
+        )
         self.selected_item_id = group["items"][0]["id"] if group and group.get("items") else None
+        item = self.get_selected_item()
+        self.selected_command_id = item["commands"][0]["id"] if item and item.get("commands") else None
         self.refresh_all()
 
     def select_item(self, item_id: str) -> None:
         group, item = self.find_item_and_parent(item_id)
         if not group or not item:
             return
+        self.debug_log(
+            f"select_item item_id={item_id!r} group_name={self.describe_text(group.get('name'))} item_name={self.describe_text(item.get('name'))} commands={len(item.get('commands', []))}"
+        )
         self.selected_group_id = group["id"]
         self.selected_item_id = item["id"]
+        self.selected_command_id = item["commands"][0]["id"] if item.get("commands") else None
         self.refresh_all()
+
+    def select_command(self, command_id: str) -> None:
+        _group, item, command = self.find_command_and_parent(command_id)
+        if not item or not command:
+            return
+        self.debug_log(
+            f"select_command command_id={command_id!r} item_name={self.describe_text(item.get('name'))} command={self.describe_text(command.get('command'))}"
+        )
+        self.selected_item_id = item["id"]
+        self.selected_command_id = command["id"]
+        self.refresh_all()
+
+    def create_list_row(self, parent, title: str, subtitle: str, selected: bool, command, menu_handler) -> ctk.CTkFrame:
+        display_title = title.strip() if isinstance(title, str) else ""
+        if not display_title:
+            self.debug_log(f"empty list title selected={selected} title={self.describe_text(title)} subtitle={self.describe_text(subtitle)}")
+            display_title = "(empty)"
+
+        row_bg = self.TOKENS["accent_soft"] if selected else self.TOKENS["panel_alt"]
+        row_hover = "#0b5aa7" if selected else self.TOKENS["panel_soft"]
+
+        row = ctk.CTkFrame(
+            parent,
+            fg_color=row_bg,
+            corner_radius=4,
+            height=30,
+            border_width=1 if selected else 0,
+            border_color=self.TOKENS["accent"] if selected else self.TOKENS["panel_alt"],
+        )
+        row.grid_propagate(False)
+
+        accent = ctk.CTkFrame(
+            row,
+            fg_color=self.TOKENS["accent"] if selected else self.TOKENS["panel_soft"],
+            width=2,
+            corner_radius=2,
+        )
+        accent.place(x=0, rely=0.08, relheight=0.84)
+
+        row_text = f"{display_title}    {subtitle}"
+        text_button = ctk.CTkButton(
+            row,
+            text=row_text,
+            command=command,
+            fg_color=row_bg,
+            hover_color=row_hover,
+            text_color=self.TOKENS["selected_text"],
+            width=10,
+            border_width=0,
+            corner_radius=3,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+            height=26,
+        )
+        text_button.place(x=10, y=2, relwidth=0.93)
+
+        # Keep simple left-click handling on row background and accent bar.
+        for widget in (row, accent):
+            widget.bind("<Button-1>", lambda _event, cb=command: cb())
+            widget.bind("<Double-Button-1>", lambda _event, cb=command: cb())
+            widget.bind("<Button-3>", menu_handler)
+
+        # Right click menu on the main row text/button.
+        text_button.bind("<Button-1>", lambda _event, cb=command: cb())
+        text_button.bind("<Double-Button-1>", lambda _event, cb=command: cb())
+        text_button.bind("<Button-3>", menu_handler)
+
+        return row
 
     def render_groups(self) -> None:
         self.clear_frame(self.group_scroll)
         groups = self.app.data.get("groups", [])
+        self.debug_log(f"render_groups count={len(groups)} selected_group_id={self.selected_group_id!r}")
         if not groups:
-            ctk.CTkLabel(self.group_scroll, text="No groups yet.", text_color=("gray40", "gray65")).grid(row=0, column=0, padx=12, pady=24, sticky="ew")
+            ctk.CTkLabel(self.group_scroll, text="No groups yet", text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, padx=10, pady=14, sticky="w")
             return
-
         for index, group in enumerate(groups):
-            row = ctk.CTkFrame(self.group_scroll, corner_radius=10)
-            row.grid(row=index, column=0, padx=6, pady=6, sticky="ew")
-            row.grid_columnconfigure(0, weight=1)
-
-            button = ctk.CTkButton(row, text=group["name"], anchor="w", height=38, command=lambda gid=group["id"]: self.select_group(gid))
-            if group["id"] == self.selected_group_id:
-                button.configure(fg_color=("#1f6aa5", "#144870"))
-            else:
-                button.configure(fg_color=("gray78", "gray23"), hover_color=("gray72", "gray28"))
-            button.grid(row=0, column=0, padx=(8, 6), pady=8, sticky="ew")
-
-            ctk.CTkButton(row, text="Edit", width=54, command=lambda gid=group["id"]: self.rename_group(gid)).grid(row=0, column=1, padx=(0, 6), pady=8)
-            ctk.CTkButton(row, text="Del", width=54, fg_color="#c0392b", hover_color="#922b21", command=lambda gid=group["id"]: self.delete_group(gid)).grid(row=0, column=2, padx=(0, 8), pady=8)
+            self.debug_log(
+                f"group[{index}] id={group.get('id')!r} name={self.describe_text(group.get('name'))} items={len(group.get('items', []))}"
+            )
+            row = self.create_list_row(self.group_scroll, group["name"], f"{len(group.get('items', []))} items", group["id"] == self.selected_group_id, lambda gid=group["id"]: self.select_group(gid), lambda event, gid=group["id"]: self.on_group_menu(event, gid))
+            row.grid(row=index, column=0, padx=3, pady=1, sticky="ew")
 
     def render_items(self) -> None:
         self.clear_frame(self.item_scroll)
         group = self.get_selected_group()
-        self.item_title.configure(text=f"Items - {group['name']}" if group else "Items")
+        self.debug_log(f"render_items selected_group={self.describe_text(group.get('name')) if group else 'None'} selected_group_id={self.selected_group_id!r} selected_item_id={self.selected_item_id!r}")
+        self.item_title.configure(text=f"ITEMS | {group['name']}" if group else "ITEMS")
         if not group:
-            ctk.CTkLabel(self.item_scroll, text="Select a group first.", text_color=("gray40", "gray65")).grid(row=0, column=0, padx=12, pady=24, sticky="ew")
+            ctk.CTkLabel(self.item_scroll, text="Select a group", text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, padx=10, pady=14, sticky="w")
             return
-
         items = group.get("items", [])
+        self.debug_log(f"items_in_group={len(items)} group_name={self.describe_text(group.get('name'))}")
         if not items:
-            ctk.CTkLabel(self.item_scroll, text="No items in this group.", text_color=("gray40", "gray65")).grid(row=0, column=0, padx=12, pady=24, sticky="ew")
+            ctk.CTkLabel(self.item_scroll, text="No items", text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, padx=10, pady=14, sticky="w")
             return
-
         for index, item in enumerate(items):
-            row = ctk.CTkFrame(self.item_scroll, corner_radius=10)
-            row.grid(row=index, column=0, padx=6, pady=6, sticky="ew")
-            row.grid_columnconfigure(0, weight=1)
-            button = ctk.CTkButton(row, text=item["name"], anchor="w", height=38, command=lambda iid=item["id"]: self.select_item(iid))
-            if item["id"] == self.selected_item_id:
-                button.configure(fg_color=("#1f6aa5", "#144870"))
-            else:
-                button.configure(fg_color=("gray78", "gray23"), hover_color=("gray72", "gray28"))
-            button.grid(row=0, column=0, padx=(8, 6), pady=8, sticky="ew")
-            ctk.CTkButton(row, text="Edit", width=54, command=lambda iid=item["id"]: self.rename_item(iid)).grid(row=0, column=1, padx=(0, 6), pady=8)
-            ctk.CTkButton(row, text="Del", width=54, fg_color="#c0392b", hover_color="#922b21", command=lambda iid=item["id"]: self.delete_item(iid)).grid(row=0, column=2, padx=(0, 8), pady=8)
+            self.debug_log(
+                f"item[{index}] id={item.get('id')!r} name={self.describe_text(item.get('name'))} commands={len(item.get('commands', []))}"
+            )
+            row = self.create_list_row(self.item_scroll, item["name"], f"{len(item.get('commands', []))} commands", item["id"] == self.selected_item_id, lambda iid=item["id"]: self.select_item(iid), lambda event, iid=item["id"]: self.on_item_menu(event, iid))
+            row.grid(row=index, column=0, padx=3, pady=1, sticky="ew")
 
     def render_commands(self) -> None:
         self.clear_frame(self.command_scroll)
         group = self.get_selected_group()
         item = self.get_selected_item()
+        command = self.get_selected_command()
+        self.debug_log(
+            f"render_commands group={self.describe_text(group.get('name')) if group else 'None'} item={self.describe_text(item.get('name')) if item else 'None'} selected_command_id={self.selected_command_id!r}"
+        )
         if not group or not item:
-            self.command_title.configure(text="Commands")
-            self.command_subtitle.configure(text="Select a group and an item.")
-            ctk.CTkLabel(self.command_scroll, text="The selected item's commands will appear here.", text_color=("gray40", "gray65")).grid(row=0, column=0, padx=16, pady=32, sticky="ew")
+            self.command_title.configure(text="No Selection")
+            self.command_subtitle.configure(text="Choose a group and item to inspect commands.")
+            self.set_preview_text("")
+            ctk.CTkLabel(self.command_scroll, text="Commands will appear here", text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, padx=10, pady=14, sticky="w")
             return
 
         commands = item.get("commands", [])
+        self.debug_log(f"commands_in_item={len(commands)} item_name={self.describe_text(item.get('name'))}")
         self.command_title.configure(text=item["name"])
-        self.command_subtitle.configure(text=f"Group: {group['name']} | Commands: {len(commands)}")
+        self.command_subtitle.configure(text=f"{group['name']} | {len(commands)} commands")
         if not commands:
-            ctk.CTkLabel(self.command_scroll, text="No commands yet.", text_color=("gray40", "gray65")).grid(row=0, column=0, padx=16, pady=32, sticky="ew")
+            self.set_preview_text("")
+            ctk.CTkLabel(self.command_scroll, text="No commands yet", text_color=self.TOKENS["text_dim"], font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, padx=10, pady=14, sticky="w")
             return
 
-        for index, command in enumerate(commands, start=1):
-            card = ctk.CTkFrame(self.command_scroll, corner_radius=12)
-            card.grid(row=index - 1, column=0, padx=8, pady=8, sticky="ew")
-            card.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(card, text=f"Command {index}", font=ctk.CTkFont(size=15, weight="bold"), anchor="w").grid(row=0, column=0, padx=14, pady=(12, 8), sticky="ew")
-            preview = ctk.CTkTextbox(card, height=96, wrap="word")
-            preview.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="ew")
-            preview.insert("1.0", command["command"])
-            preview.configure(state="disabled")
-            row = ctk.CTkFrame(card, fg_color="transparent")
-            row.grid(row=2, column=0, padx=14, pady=(0, 12), sticky="e")
-            ctk.CTkButton(row, text="Edit", width=78, command=lambda cid=command["id"]: self.edit_command(cid)).pack(side="left", padx=(0, 8))
-            ctk.CTkButton(row, text="Copy", width=78, command=lambda text=command["command"]: self.copy_command(text)).pack(side="left", padx=(0, 8))
-            ctk.CTkButton(row, text="Run", width=78, command=lambda text=command["command"], label=f"{item['name']} / Command {index}": self.app.send_to_active_terminal(text, label)).pack(side="left", padx=(0, 8))
-            ctk.CTkButton(row, text="Delete", width=78, fg_color="#c0392b", hover_color="#922b21", command=lambda cid=command["id"]: self.delete_command(cid)).pack(side="left")
+        for index, entry in enumerate(commands):
+            self.debug_log(
+                f"command[{index}] id={entry.get('id')!r} command={self.describe_text(entry.get('command'))}"
+            )
+            row = self.create_list_row(self.command_scroll, entry["command"].splitlines()[0][:72] or "(empty)", f"#{index + 1} | {len(entry['command'].splitlines())} lines", entry["id"] == self.selected_command_id, lambda cid=entry["id"]: self.select_command(cid), lambda event, cid=entry["id"]: self.on_command_menu(event, cid))
+            row.grid(row=index, column=0, padx=3, pady=1, sticky="ew")
+        self.set_preview_text(command["command"] if command else "")
+
+    def set_preview_text(self, text: str) -> None:
+        self.command_preview.configure(state="normal")
+        self.command_preview.delete("1.0", "end")
+        if text:
+            self.command_preview.insert("1.0", text)
+        self.command_preview.configure(state="disabled")
+
+    def on_group_menu(self, event: tk.Event, group_id: str) -> None:
+        self.select_group(group_id)
+        self.show_menu(self.group_menu, event)
+
+    def on_item_menu(self, event: tk.Event, item_id: str) -> None:
+        self.select_item(item_id)
+        self.show_menu(self.item_menu, event)
+
+    def on_command_menu(self, event: tk.Event, command_id: str) -> None:
+        self.select_command(command_id)
+        self.show_menu(self.command_menu, event)
 
     def add_group(self) -> None:
         name = SingleLineDialog.ask(self, "New Group", "Enter group name:")
@@ -1093,9 +1559,14 @@ class QuickCommandWindow(ctk.CTkToplevel):
         self.app.data["groups"].append(new_group)
         self.selected_group_id = new_group["id"]
         self.selected_item_id = None
+        self.selected_command_id = None
         self.app.save_data()
         self.refresh_all()
         self.app.append_status(f"Created group: {name}")
+
+    def rename_selected_group(self) -> None:
+        if self.selected_group_id:
+            self.rename_group(self.selected_group_id)
 
     def rename_group(self, group_id: str) -> None:
         group = next((group for group in self.app.data.get("groups", []) if group["id"] == group_id), None)
@@ -1121,9 +1592,14 @@ class QuickCommandWindow(ctk.CTkToplevel):
         if self.selected_group_id == group_id:
             self.selected_group_id = None
             self.selected_item_id = None
+            self.selected_command_id = None
         self.app.save_data()
         self.refresh_all()
         self.app.append_status(f"Deleted group: {target['name']}")
+
+    def delete_selected_group(self) -> None:
+        if self.selected_group_id:
+            self.delete_group(self.selected_group_id)
 
     def add_item(self) -> None:
         group = self.get_selected_group()
@@ -1136,9 +1612,14 @@ class QuickCommandWindow(ctk.CTkToplevel):
         new_item = {"id": uuid.uuid4().hex, "name": name, "commands": []}
         group["items"].append(new_item)
         self.selected_item_id = new_item["id"]
+        self.selected_command_id = None
         self.app.save_data()
         self.refresh_all()
         self.app.append_status(f"Created item '{name}' in group '{group['name']}'")
+
+    def rename_selected_item(self) -> None:
+        if self.selected_item_id:
+            self.rename_item(self.selected_item_id)
 
     def rename_item(self, item_id: str) -> None:
         _group, item = self.find_item_and_parent(item_id)
@@ -1162,9 +1643,14 @@ class QuickCommandWindow(ctk.CTkToplevel):
         group["items"] = [candidate for candidate in group.get("items", []) if candidate["id"] != item_id]
         if self.selected_item_id == item_id:
             self.selected_item_id = None
+            self.selected_command_id = None
         self.app.save_data()
         self.refresh_all()
         self.app.append_status(f"Deleted item: {item['name']}")
+
+    def delete_selected_item(self) -> None:
+        if self.selected_item_id:
+            self.delete_item(self.selected_item_id)
 
     def add_command(self) -> None:
         item = self.get_selected_item()
@@ -1174,10 +1660,16 @@ class QuickCommandWindow(ctk.CTkToplevel):
         command_text = CommandDialog.ask(self, "Add Command")
         if not command_text:
             return
-        item["commands"].append({"id": uuid.uuid4().hex, "command": command_text})
+        new_command = {"id": uuid.uuid4().hex, "command": command_text}
+        item["commands"].append(new_command)
+        self.selected_command_id = new_command["id"]
         self.app.save_data()
         self.refresh_all()
         self.app.append_status(f"Added command to item '{item['name']}'")
+
+    def edit_selected_command(self) -> None:
+        if self.selected_command_id:
+            self.edit_command(self.selected_command_id)
 
     def edit_command(self, command_id: str) -> None:
         _group, item, command = self.find_command_and_parent(command_id)
@@ -1198,14 +1690,34 @@ class QuickCommandWindow(ctk.CTkToplevel):
         if not messagebox.askyesno("Delete Command", "Delete this command?", parent=self):
             return
         item["commands"] = [candidate for candidate in item.get("commands", []) if candidate["id"] != command_id]
+        if self.selected_command_id == command_id:
+            self.selected_command_id = item["commands"][0]["id"] if item.get("commands") else None
         self.app.save_data()
         self.refresh_all()
         self.app.append_status(f"Deleted command: {command['command'].splitlines()[0][:60]}")
+
+    def delete_selected_command(self) -> None:
+        if self.selected_command_id:
+            self.delete_command(self.selected_command_id)
+
+    def copy_selected_command(self) -> None:
+        command = self.get_selected_command()
+        if command:
+            self.copy_command(command["command"])
 
     def copy_command(self, command_text: str) -> None:
         self.clipboard_clear()
         self.clipboard_append(command_text)
         self.app.append_status("Command copied to clipboard.")
+
+    def run_selected_command(self) -> None:
+        item = self.get_selected_item()
+        command = self.get_selected_command()
+        if not item or not command:
+            return
+        commands = item.get("commands", [])
+        index = next((idx + 1 for idx, entry in enumerate(commands) if entry["id"] == command["id"]), 1)
+        self.app.send_to_active_terminal(command["command"], f"{item['name']} / Command {index}")
 
     def run_all_commands(self) -> None:
         item = self.get_selected_item()
@@ -1225,6 +1737,7 @@ class QuickCommandWindow(ctk.CTkToplevel):
 class QuickCommandApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+        self.report_callback_exception = self.on_tk_exception
 
         self.base_dir = app_directory()
         self.data_file = os.path.join(self.base_dir, "data.json")
@@ -1242,13 +1755,11 @@ class QuickCommandApp(ctk.CTk):
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
-        self.grid_rowconfigure(2, weight=0)
 
         self.create_toolbar()
         self.create_workspace()
-        self.create_status_log()
         self.create_initial_tab()
-        self.after(200, self.prime_quick_command_window)
+        self.deiconify()
 
     def create_toolbar(self) -> None:
         self.toolbar = ctk.CTkFrame(self, height=60, corner_radius=0)
@@ -1271,34 +1782,8 @@ class QuickCommandApp(ctk.CTk):
         self.notebook.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
 
-    def create_status_log(self) -> None:
-        self.status_frame = ctk.CTkFrame(self, height=150)
-        self.status_frame.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
-        self.status_frame.grid_columnconfigure(0, weight=1)
-        self.status_frame.grid_rowconfigure(1, weight=1)
-
-        header = ctk.CTkFrame(self.status_frame, fg_color="transparent")
-        header.grid(row=0, column=0, padx=12, pady=(12, 6), sticky="ew")
-        header.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(header, text="Status Log", font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(header, text="Clear", width=80, command=self.clear_status_log).grid(row=0, column=1, sticky="e")
-
-        self.status_log = ctk.CTkTextbox(self.status_frame, height=110, wrap="word")
-        self.status_log.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="nsew")
-        self.status_log.configure(state="disabled")
-
     def create_initial_tab(self) -> None:
         self.add_tab()
-
-    def prime_quick_command_window(self) -> None:
-        if self.quick_command_window is not None and self.quick_command_window.winfo_exists():
-            return
-        try:
-            self.quick_command_window = QuickCommandWindow(self)
-            self.quick_command_window.withdraw()
-        except Exception as error:
-            self.quick_command_window = None
-            self.append_status(f"Quick Command preload failed: {error}")
 
     def add_tab(self) -> None:
         self.tab_counter += 1
@@ -1379,18 +1864,28 @@ class QuickCommandApp(ctk.CTk):
         self.active_terminal.send_command(command_text)
         self.append_status(f"Sent to terminal: {label}")
 
+    def on_tk_exception(self, exc: type[BaseException], val: BaseException, tb: Any) -> None:
+        details = "".join(traceback.format_exception(exc, val, tb))
+        write_startup_log(details)
+        try:
+            messagebox.showerror("Quick Command", details, parent=self)
+        except Exception:
+            pass
+
     def append_status(self, message: str) -> None:
-        self.status_log.configure(state="normal")
-        self.status_log.insert("end", message + "\n")
-        self.status_log.see("end")
-        self.status_log.configure(state="disabled")
+        _ = message
 
     def clear_status_log(self) -> None:
-        self.status_log.configure(state="normal")
-        self.status_log.delete("1.0", "end")
-        self.status_log.configure(state="disabled")
+        return
 
 
 if __name__ == "__main__":
-    app = QuickCommandApp()
-    app.mainloop()
+    write_startup_log("=== launch ===")
+    try:
+        app = QuickCommandApp()
+        write_startup_log("app initialized")
+        app.mainloop()
+        write_startup_log("mainloop exited")
+    except Exception:
+        write_startup_log("".join(traceback.format_exc()))
+        raise
