@@ -632,6 +632,17 @@ class EmbeddedTerminal(ctk.CTkFrame):
         if kind != "vim":
             return
 
+        raw_user_input = self.current_input if from_prompt else ""
+        self.current_input = ""
+        if from_prompt:
+            self.is_command_line_mode = False
+            if self.pty_process is not None:
+                try:
+                    self.pty_process.sendintr()
+                except Exception:
+                    pass
+            self.write_text("\x03")
+
         target_path = compat_command.get("target_path")
         if target_path:
             target_directory = os.path.dirname(target_path)
@@ -644,12 +655,8 @@ class EmbeddedTerminal(ctk.CTkFrame):
         else:
             subprocess.Popen(["notepad.exe"], cwd=self.current_directory)
 
-        if from_prompt:
-            if self.current_input:
-                self.erase_current_input_from_terminal()
-            self.current_input = ""
-            self.is_command_line_mode = False
-            self.write_text("\r")
+        if from_prompt and raw_user_input:
+            write_startup_log(f"compat vim intercepted: {raw_user_input}")
         self.text_widget.focus_set()
 
     def map_find_command(self, stripped_command: str) -> Optional[str]:
