@@ -1,6 +1,8 @@
-.venv/
 __pycache__/
 *.pyc
-tmp*/
-build/
 dist/
+build/
+*.spec
+*.log
+.venv/
+tmp*/
