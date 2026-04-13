@@ -1,0 +1,54 @@
+{
+  "groups": [
+    {
+      "id": "1c2523ea86374a14ad7e30d799c63f53",
+      "name": "1112",
+      "items": [
+        {
+          "id": "77506a638c2c4097a9625c30a8724686",
+          "name": "222",
+          "commands": [
+            {
+              "id": "41c3e82dd39c4f76a9b4c579c4b51954",
+              "command": "# test\nls\ngit log"
+            },
+            {
+              "id": "89aa21ef6c2e4240a679bef33a49ed40",
+              "command": "git status"
+            },
+            {
+              "id": "c21079bf98494c5ebd9d61513dcf265b",
+              "command": "ls\ngit log\ngit status"
+            }
+          ]
+        },
+        {
+          "id": "8947c9e4af15417eba02e55affc64f0c",
+          "name": "t",
+          "commands": [
+            {
+              "id": "d28210dbcc5b4805a6414f7f0720f74d",
+              "command": "jjh"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "993b1465cb0b42dc83afc8dd5e6797c4",
+      "name": "ddd",
+      "items": [
+        {
+          "id": "43aec83524ab4aaaa6dda89beb937195",
+          "name": "rrr",
+          "commands": []
+        }
+      ]
+    },
+    {
+      "id": "f2def8b0bc2246ca80c86ea43f695d81",
+      "name": "顶顶顶",
+      "items": []
+    }
+  ]
+}
