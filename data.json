@@ -1,17 +1,6 @@
 {
   "groups": [
     {
-      "id": "49d6198473914168b70b76829cdadfb7",
-      "name": "test",
-      "items": [
-        {
-          "id": "5b449c716c7c4460874e461e0b26882b",
-          "name": "顶顶顶",
-          "commands": []
-        }
-      ]
-    },
-    {
       "id": "1c2523ea86374a14ad7e30d799c63f53",
       "name": "1112",
       "items": [
@@ -21,28 +10,25 @@
           "commands": [
             {
               "id": "41c3e82dd39c4f76a9b4c579c4b51954",
-              "command": "ls\ngit log"
+              "command": "# test\nls\ngit log"
+            },
+            {
+              "id": "89aa21ef6c2e4240a679bef33a49ed40",
+              "command": "git status"
+            },
+            {
+              "id": "c21079bf98494c5ebd9d61513dcf265b",
+              "command": "ls\ngit log\ngit status"
             }
           ]
-        }
-      ]
-    },
-    {
-      "id": "339156a8e1cd4d7da04f645600e93df3",
-      "name": "111",
-      "items": [
-        {
-          "id": "307b547cd5304b88bfa7c16bc48dbd91",
-          "name": "99",
-          "commands": []
         },
         {
-          "id": "7598ccb7d50041e88f873aa800a3f256",
-          "name": "2",
+          "id": "8947c9e4af15417eba02e55affc64f0c",
+          "name": "t",
           "commands": [
             {
-              "id": "8d968418f9334a8aa9efb97c2238b779",
-              "command": "ls\ngit log"
+              "id": "d28210dbcc5b4805a6414f7f0720f74d",
+              "command": "jjh"
             }
           ]
         }
